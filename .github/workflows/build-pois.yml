@@ -1,0 +1,62 @@
+name: Build Global POI JSON
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'poi-builder/**'
+      - '.github/workflows/build-pois.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: global-poi-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: pip install --disable-pip-version-check overturemaps pycountry
+      - name: Reconstruct source JSON
+        run: cat poi-builder/seed_parts/*.xz.b64 | base64 --decode | xz --decompress > seed.json
+      - name: Validate source JSON
+        run: python -m json.tool seed.json > /dev/null
+      - name: Build ranked POI JSON
+        run: python poi-builder/builder.py
+      - name: Validate output JSON
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('countries_destinations_with_top_20_pois.json')
+          data=json.loads(p.read_text(encoding='utf-8'))
+          cities=[city for country in data for city in country['attractions']]
+          assert len(data)==176, len(data)
+          assert all(len(country['attractions'])<=10 for country in data)
+          assert all([poi['rank'] for poi in city['pois']]==list(range(1,len(city['pois'])+1)) for city in cities)
+          assert all(poi['category'] in {'tourist_attraction','restaurant','hotel','bar'} for city in cities for poi in city['pois'])
+          assert all(-90 <= poi['latitude'] <= 90 and -180 <= poi['longitude'] <= 180 for city in cities for poi in city['pois'])
+          print({'countries':len(data),'cities':len(cities),'pois':sum(len(c['pois']) for c in cities),'bytes':p.stat().st_size})
+          PY
+      - name: Commit generated output
+        run: |
+          mkdir -p generated
+          mv countries_destinations_with_top_20_pois.json generated/
+          mv poi_stats.json generated/
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add generated/
+          git commit -m 'Generate global top-20 POI JSON' || exit 0
+          git push origin master
